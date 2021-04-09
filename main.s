@@ -20,11 +20,15 @@
 .define SNAKE_START_DIR DIR_RIGHT
 .define SNAKE_START_OFFSET $0001
 .define SNAKE_START_LEN 5
+.defiNE SNAKE_GROWTH 1
 
+.define LFSR_POLY $a6
+.define LFSR_SEED $55
 
 .ramsection "Work Vars" slot 2
 snake_head dw
 snake_tail dw
+snake_growth_cnt db
 dir db
 framecount db
 vblank_flag db
@@ -37,6 +41,9 @@ xpos_old db
 ypos_old db
 vx db
 vy db
+lfsr db
+food_tile dw
+food_hit_flag db
 .ends
 
 .ramsection "Tile Attrs" slot 2
@@ -86,7 +93,7 @@ tile_attributes ds 640
     ; Load tile set into VRAM
     ld HL,$8000
     ld DE,tiles
-    ld BC,$20
+    ld BC,$30
     call memcpy
 
     ; Set up tile attributes
@@ -117,8 +124,6 @@ tile_attributes ds 640
     ld A,NFRAMES
     ld HL,framecount
     ld (HL),A
-
-    ld B,B
 
     ; Set up snake start position
     ld C,SNAKE_START_DIR << 1
@@ -171,7 +176,18 @@ tile_attributes ds 640
     ld (HL),A
     inc HL
     ld (HL),A
-    ld HL,stale_flag
+    ld (stale_flag),A
+    ld (food_hit_flag),A
+    ld (snake_growth_cnt),A
+
+    call rand_tile_offset
+    ld HL,food_tile
+    ld (HL),C
+    inc HL
+    ld (HL),B
+    ld HL,tile_attributes
+    add HL,BC
+    ld A,$40
     ld (HL),A
 
     ld A,$01
@@ -248,8 +264,17 @@ main_loop:
     ld D,A
 
 
+    ; First check if the new head hit the food tile
+    ld A,(HL)
+    bit 6,A
+    jr z,+
+    ld A,1
+    ld (food_hit_flag),A
+    ld A,SNAKE_GROWTH+1
+    ld (snake_growth_cnt),A
+
     ; Set up new tiles attributes
-    ld A,$80
++   ld A,$80
     ld E,D
     sla E
     sla E ; C = dir << 2
@@ -275,13 +300,19 @@ main_loop:
     ld (HL),A
 
 
-    ld HL,snake_tail
+    xor A
+    ld HL,snake_growth_cnt
+    or (HL)
+    jr z,+
+    dec (HL)
+    jr nz,++
+
++   ld HL,snake_tail
     push HL
     ld E,(HL)
     inc HL
     ld D,(HL)
 
-    ld B,B
     ld HL,tile_attributes
     add HL,DE
     ld A,(HL)
@@ -311,11 +342,33 @@ main_loop:
     inc HL
     ld (HL),D
 
-    ld HL,stale_flag
+++  ld HL,stale_flag
     ld A,$01
     ld (HL),A
 
-    jp main_loop
+    ld A,(food_hit_flag)
+    or A
+    jr z,+
+
+-   call rand_tile_offset
+    ld HL,tile_attributes
+    add HL,BC
+    ld A,(HL)
+    bit 7,A
+    jr nz,-
+
+    or $40
+    ld (HL),A
+
+    ld HL,food_tile
+    ld (HL),C
+    inc HL
+    ld (HL),B
+
+    xor A
+    ld (food_hit_flag),A
+
++   jp main_loop
 
 ; A - new map value
 ; B - X pos
@@ -396,8 +449,6 @@ check_pressed:
     ; Nothing to do if nothing was pressed
     or A
     ret z
-
-    ld b,b
 
     ld HL,dir
 
@@ -491,6 +542,15 @@ vblank_isr:
     ld A,$01
     ld (HL),A
 
+    ld HL,food_tile
+    ld C,(HL)
+    inc HL
+    ld B,(HL)
+    ld HL,TILEMAP0
+    add HL,BC
+    ld A,$02
+    ld (HL),A
+
     xor A
     ld HL,stale_flag
     ld (HL),A
@@ -512,6 +572,50 @@ vblank_isr:
     pop AF
     reti
 
+prng_rand:
+    ld HL,lfsr
+    ld A,(HL)
+    rrca
+    jr nc,+
+    xor LFSR_POLY
++   ld (HL),A
+    ret
+
+rand_tile_offset:
+    ld B,0
+    call prng_rand
+    and $1f
+    ld E,A
+    ld D,0
+    ld HL,rand_18_table
+    add HL,DE
+    ld C,(HL)
+
+    ;; << 5 (*32)
+    sla C
+    rl B
+    sla C
+    rl B
+    sla C
+    rl B
+    sla C
+    rl B
+    sla C
+    rl B
+
+    call prng_rand
+    and $1f
+    ld E,A
+    ld D,0
+    ld HL,rand_20_table
+    add HL,DE
+    ld A,(HL)
+    or C
+    ld C,A
+
+    ret
+
+
 .bank 1 slot 1
 .org $00
 tiles:
@@ -519,6 +623,8 @@ tiles:
     .db $00, $00, $00, $00, $00, $00, $00, $00
     .db $ff, $ff, $ff, $81, $ff, $bd, $ff, $bd
     .db $ff, $bd, $ff, $bd, $ff, $81, $ff, $ff
+    .db $ff, $ff, $ff, $ff, $ff, $ff, $ff, $ff
+    .db $ff, $ff, $ff, $ff, $ff, $ff, $ff, $ff
 
 nonplayable_line:
     .db $80, $80, $80, $80, $80, $80, $80, $80
@@ -534,3 +640,19 @@ playable_line:
 
 dir_offset_map:
     .db $e0, $ff, $ff, $ff, $01, $00, $20, $00
+
+; This isn't perfect (uneven distribution), but it's the most
+; efficient way take a LFSR-generated pseudo-random byte to X
+; or Y coordinate. This uses the lower 5 bits of the PRNG
+; and maps them to a scaled X or Y value.
+rand_20_table:
+    .db  1,  1,  2,  2,  3,  4,  4,  5
+    .db  6,  6,  7,  7,  8,  9,  9, 10
+    .db 11, 11, 12, 12, 13, 14, 14, 15
+    .db 16, 16, 17, 17, 18, 19, 19, 20
+
+rand_18_table:
+    .db  1,  1,  2,  2,  3,  3,  4,  4
+    .db  5,  6,  6,  7,  7,  8,  8,  9
+    .db 10, 10, 11, 11, 12, 12, 13, 13
+    .db 14, 15, 15, 16, 16, 17, 17, 18
