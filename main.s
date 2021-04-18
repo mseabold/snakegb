@@ -2,7 +2,9 @@
 .include "hardware.inc"
 .include "gb_header.inc"
 
-.define NFRAMES 5
+.define NFRAMES_HARD 5
+.define NFRAMES_MEDIUM 10
+.define NFRAMES_EASY 15
 
 ; Direction is store in 2 bits. Opposite directions are the complement of each other:
 ;    Up    - 0b00
@@ -20,10 +22,9 @@
 .define SNAKE_START_DIR DIR_RIGHT
 .define SNAKE_START_OFFSET $0001
 .define SNAKE_START_LEN 5
-.defiNE SNAKE_GROWTH 1
+.defiNE SNAKE_GROWTH 2
 
 .define LFSR_POLY $a6
-.define LFSR_SEED $55
 
 .ramsection "Work Vars" slot 2
 snake_head dw
@@ -44,6 +45,8 @@ vy db
 lfsr db
 food_tile dw
 food_hit_flag db
+difficulty db
+speed db
 .ends
 
 .ramsection "Tile Attrs" slot 2
@@ -73,14 +76,103 @@ tile_attributes ds 640
     jp $150
 
 .org $150
-    ld B,$03
-    ld C,$01
+main:
+    call wait_vblank
 
-    ; Wait for first vblank
---  ld A,(STAT)
-    and B
-    cp C
+    xor A
+    ld (LCDC),A ; disable LCD
+
+    ld HL,$fe00
+    ld BC,$a0
+    call memset
+
+    ; Load tile set into VRAM
+    ld HL,$8000
+    ld DE,tiles
+    ld BC,$0210
+    call memcpy
+
+    ; Keep HL at the same location
+    ld DE,font
+    ld BC,SIZEOF_FONT
+
+-   ld A,B
+    or C
+    jr z,+
+    ld A,(DE)
+    inc DE
+    ld (HL+),A
+    ld (HL+),A
+    dec BC
+    jr -
+
++   ld HL,TILEMAP0
+    ld DE,start_screen_map
+    ld C,18
+-   ld B,20
+--  ld A,(DE)
+    ld (HL+),A
+    inc DE
+    dec B
     jr nz,--
+    xor A
+    ld B,12
+--- ld (HL+),A
+    dec B
+    jr nz,---
+    dec C
+    jr nz,-
+
+    xor A
+    ld (joypad_held),A
+    ld (joypad_pressed),A
+    ld (difficulty),A
+
+    ld HL,$fe00
+    ld (HL),96
+    inc HL
+    ld (HL),56
+    inc HL
+    ld (HL),2
+
+    ld A,$93
+    ld (LCDC),A ; Restart the LCD (8000 data made, BG map at 9800)
+
+
+-   call wait_vblank
+    call get_joypad
+
+    ld A,(joypad_pressed)
+    ld B,A
+    ld A,(difficulty)
+    bit 0,B
+    jr z,+
+    ld A,(DIV)
+    ld (lfsr),A
+    jp reset_game
++   bit 7,B
+    jr z,+
+    cp A,2
+    jr z,-
+    inc A
+    ld (difficulty),A
+    ld A,($fe00)
+    add 16
+    ld ($fe00),A
+    jr -
++   bit 6,B
+    jr z,-
+    or A
+    jr z,-
+    dec A
+    ld (difficulty),A
+    ld A,($fe00)
+    add -16
+    ld ($fe00),A
+    jr -
+
+reset_game:
+    call wait_vblank
 
     xor A
     ld (LCDC),A ; disable LCD
@@ -89,12 +181,6 @@ tile_attributes ds 640
     LD HL,TILEMAP0
     ld BC,$400
     call memset
-
-    ; Load tile set into VRAM
-    ld HL,$8000
-    ld DE,tiles
-    ld BC,$30
-    call memcpy
 
     ; Set up tile attributes
     ;
@@ -120,8 +206,16 @@ tile_attributes ds 640
     ld BC,$20
     call memcpy
 
+    ld HL,difficulty_map
+    ld B,0
+    ld A,(difficulty)
+    ld C,A
+    add HL,BC
+    ld A,(HL)
+    ld (speed),A
+
     ; Initialize the frame counter that control movement speed
-    ld A,NFRAMES
+    ld A,(speed)
     ld HL,framecount
     ld (HL),A
 
@@ -180,7 +274,12 @@ tile_attributes ds 640
     ld (food_hit_flag),A
     ld (snake_growth_cnt),A
 
-    call rand_tile_offset
+-   call rand_tile_offset
+    ld HL,tile_attributes
+    add HL,BC
+    bit 7,(HL)
+    jr nz,-
+
     ld HL,food_tile
     ld (HL),C
     inc HL
@@ -225,7 +324,7 @@ main_loop:
     dec (HL)
     jr nz,main_loop
 
-    ld A,NFRAMES
+    ld A,(speed)
     ld (HL),A
 
     ld HL,dir
@@ -256,7 +355,7 @@ main_loop:
     jr z,+
     pop HL
     pop BC
-    jr main_loop
+    jp reset_game
 
     ; Get direction again
 +   ld DE,dir
@@ -454,22 +553,28 @@ check_pressed:
 
     bit 7,A
     jr z,@joypad_check_up
-    ld (HL),DIR_DOWN
-    ret
+    ld B,DIR_DOWN
+    jp +
 @joypad_check_up:
     bit 6,A
     jr z,@joypad_check_left
-    ld (HL),DIR_UP
-    ret
+    ld B,DIR_UP
+    jp +
 @joypad_check_left:
     bit 5,A
     jr z,@joypad_check_right
-    ld (HL),DIR_LEFT
-    ret
+    ld B,DIR_LEFT
+    jp +
 @joypad_check_right:
     bit 4,A
     ret z
-    ld (HL),DIR_RIGHT
+    ld B,DIR_RIGHT
+
++   ld A,B
+    xor (HL)
+    cp 3 ; Can't move in opposite direction (insta-death
+    ret z
+    ld (HL),B
     ret
 
 ; HL - destination
@@ -615,16 +720,25 @@ rand_tile_offset:
 
     ret
 
+wait_vblank:
+    push AF
+    push BC
+
+    ld B,$03
+    ld C,$01
+
+-   ld A,(STAT)
+    and B
+    cp C
+    jr nz,-
+
+    pop BC
+    pop AF
+
+    ret
 
 .bank 1 slot 1
 .org $00
-tiles:
-    .db $00, $00, $00, $00, $00, $00, $00, $00
-    .db $00, $00, $00, $00, $00, $00, $00, $00
-    .db $ff, $ff, $ff, $81, $ff, $bd, $ff, $bd
-    .db $ff, $bd, $ff, $bd, $ff, $81, $ff, $ff
-    .db $ff, $ff, $ff, $ff, $ff, $ff, $ff, $ff
-    .db $ff, $ff, $ff, $ff, $ff, $ff, $ff, $ff
 
 nonplayable_line:
     .db $80, $80, $80, $80, $80, $80, $80, $80
@@ -641,6 +755,9 @@ playable_line:
 dir_offset_map:
     .db $e0, $ff, $ff, $ff, $01, $00, $20, $00
 
+difficulty_map:
+    .db NFRAMES_EASY, NFRAMES_MEDIUM, NFRAMES_HARD
+
 ; This isn't perfect (uneven distribution), but it's the most
 ; efficient way take a LFSR-generated pseudo-random byte to X
 ; or Y coordinate. This uses the lower 5 bits of the PRNG
@@ -656,3 +773,121 @@ rand_18_table:
     .db  5,  6,  6,  7,  7,  8,  8,  9
     .db 10, 10, 11, 11, 12, 12, 13, 13
     .db 14, 15, 15, 16, 16, 17, 17, 18
+
+tiles:
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $ff, $ff, $ff, $81, $ff, $bd, $ff, $bd
+    .db $ff, $bd, $ff, $bd, $ff, $81, $ff, $ff
+    .db $00, $00, $18, $18, $18, $18, $7e, $7e
+    .db $7e, $7e, $18, $18, $18, $18, $00, $00
+    .db $3f, $3f, $20, $20, $20, $20, $20, $20
+    .db $20, $20, $20, $20, $20, $20, $20, $20
+    .db $ff, $ff, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $f0, $f0, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $0c, $0c, $0c, $0c, $0a, $0a, $0a, $0a
+    .db $09, $09, $09, $09, $08, $08, $08, $08
+    .db $00, $00, $01, $01, $01, $01, $01, $01
+    .db $01, $01, $01, $01, $81, $81, $81, $81
+    .db $3f, $3f, $40, $40, $40, $40, $40, $40
+    .db $40, $40, $40, $40, $40, $40, $40, $40
+    .db $80, $80, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $20, $20, $20, $20, $20, $20, $20, $20
+    .db $20, $20, $20, $20, $20, $20, $20, $20
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $03, $03, $0c, $0c, $70, $70
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $60, $60, $80, $80, $00, $00, $00, $00
+    .db $20, $20, $20, $20, $20, $20, $3f, $3f
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $ff, $ff
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $f0, $f0
+    .db $10, $10, $10, $10, $10, $10, $10, $10
+    .db $08, $08, $08, $08, $08, $08, $08, $08
+    .db $08, $08, $08, $08, $08, $08, $08, $08
+    .db $41, $41, $41, $41, $21, $21, $21, $21
+    .db $11, $11, $11, $11, $09, $09, $09, $09
+    .db $40, $40, $40, $40, $40, $40, $7f, $7f
+    .db $40, $40, $40, $40, $40, $40, $40, $40
+    .db $00, $00, $00, $00, $00, $00, $80, $80
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $23, $23, $2c, $2c, $30, $30, $20, $20
+    .db $20, $20, $20, $20, $20, $20, $20, $20
+    .db $80, $80, $80, $80, $80, $80, $40, $40
+    .db $20, $20, $20, $20, $10, $10, $08, $08
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $3f, $3f, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $ff, $ff, $00, $00, $00, $00, $00, $00
+    .db $10, $10, $10, $10, $10, $10, $10, $10
+    .db $f0, $f0, $00, $00, $00, $00, $00, $00
+    .db $08, $08, $08, $08, $08, $08, $08, $08
+    .db $08, $08, $00, $00, $00, $00, $00, $00
+    .db $05, $05, $05, $05, $03, $03, $03, $03
+    .db $01, $01, $01, $01, $00, $00, $00, $00
+    .db $40, $40, $40, $40, $40, $40, $40, $40
+    .db $40, $40, $40, $40, $3f, $3f, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $ff, $ff, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $80, $80, $00, $00
+    .db $04, $04, $04, $04, $02, $02, $01, $01
+    .db $01, $01, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $80, $80, $40, $40, $40, $40
+    .db $20, $20, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+
+start_screen_map:
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $03, $04, $05, $00, $06, $07
+    .db $00, $00, $08, $04, $09, $00, $0a, $0b
+    .db $0c, $00, $00, $00, $00, $00, $0d, $0e
+    .db $0f, $00, $10, $11, $00, $00, $12, $0e
+    .db $13, $00, $14, $15, $00, $00, $00, $00
+    .db $00, $00, $16, $17, $18, $00, $19, $1a
+    .db $00, $00, $1b, $1c, $1d, $00, $0a, $1e
+    .db $1f, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $20, $00, $20, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $46
+    .db $42, $54, $5a, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $4e
+    .db $46, $45, $4a, $56, $4e, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $49
+    .db $42, $53, $45, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+    .db $00, $00, $00, $00, $00, $00, $00, $00
+
+font:
+    .incbin "font.bin" FSIZE SIZEOF_FONT
